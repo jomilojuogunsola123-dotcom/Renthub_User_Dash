@@ -278,6 +278,30 @@
     <p class="text-sm text-slate-500 text-center mb-6">
       A valid government ID and a selfie are both required. Your selfie must match the photo on your ID.
     </p>
+    
+<div class="mb-4">
+  <label class="block text-sm font-bold mb-1" for="documentType">
+    Document type
+  </label>
+  <select id="documentType"
+          class="w-full h-12 px-4 border border-slate-300 rounded-xl bg-white">
+    <option value="national_id">NIN (National ID)</option>
+    <option value="voters_card">Voter's card</option>
+    <option value="drivers_license">Driver's licence</option>
+    <option value="passport">International passport</option>
+  </select>
+</div>
+
+<div class="mb-4">
+  <label class="block text-sm font-bold mb-1" for="documentNumber">
+    Document number
+  </label>
+  <input type="text" id="documentNumber"
+         placeholder="Enter document number"
+         autocomplete="off"
+         class="w-full h-12 px-4 border border-slate-300 rounded-xl">
+</div>
+
 
     <button type="button" id="idButton"
             class="w-full flex items-center gap-3 p-3 mb-3 text-left bg-white border border-slate-300 rounded-2xl hover:border-blue-600">

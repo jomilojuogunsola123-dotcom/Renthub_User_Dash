@@ -55,6 +55,107 @@ var LISTINGS_KEY = "renthub_listings";
 var SESSION_KEY = "renthub_session";
 var currentEmail = "";
 
+
+const CLOUDINARY_CLOUD_NAME = "tio8ftqg";
+const CLOUDINARY_UPLOAD_PRESET = "jgerpbpi";
+
+async function uploadKycFile(file) {
+  const formData = new FormData();
+
+  formData.append("file", file);
+  formData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+  formData.append("folder", "rentit/kyc");
+
+  const response = await fetch(
+    `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`,
+    {
+      method: "POST",
+      body: formData
+    }
+  );
+
+  const result = await response.json();
+
+  if (!response.ok || !result.secure_url) {
+    throw new Error("Image upload failed. Please try again.");
+  }
+
+  return result.secure_url;
+}
+
+
+const RENTIT_API = "https://rentit-auth-kyc.onrender.com/api";
+const AUTH_TOKEN_KEY = "renthub_token";
+
+async function rentitRequest(endpoint, options = {}) {
+  const token = localStorage.getItem(AUTH_TOKEN_KEY);
+
+  const headers = {
+    "Content-Type": "application/json",
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...options.headers
+  };
+
+  const response = await fetch(`${RENTIT_API}${endpoint}`, {
+    ...options,
+    headers
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(data.message || `Request failed (${response.status})`);
+  }
+
+  return data;
+}
+
+
+async function fetchMyKyc() {
+  try {
+    const result = await rentitRequest("/kyc/me");
+    return result.kyc || null;
+  } catch (error) {
+    // A new user may not have submitted KYC yet.
+    if (error.message === "KYC record not found") {
+      return null;
+    }
+
+    // Don't hide genuine network or authentication errors.
+    throw error;
+  }
+}
+
+function saveBackendUser(user, token) {
+  const email = user.email.toLowerCase();
+
+  // Keep the profile information the existing screens use.
+  // Never save the user's password in localStorage.
+  const users = getUsers();
+
+  users[email] = {
+    ...(users[email] || {}),
+    id: user.id || user._id,
+    role: user.role,
+    firstName: (user.name || "").split(" ")[0] || "",
+    lastName: (user.name || "").split(" ").slice(1).join(" "),
+    email: user.email,
+    kycSubmitted: false,
+    kycVerified: false,
+    finishedSetup: false
+  };
+
+  saveUsers(users);
+
+  currentEmail = email;
+  setSession(email);
+
+  if (token) {
+    localStorage.setItem(AUTH_TOKEN_KEY, token);
+  }
+}
+
+
 function readJSON(key, fallback) {
   try {
     var raw = localStorage.getItem(key);
@@ -385,7 +486,8 @@ signupFields.forEach(function (id) {
   box.addEventListener("change", recheck);
 });
 
-byId("signupForm").addEventListener("submit", function (e) {
+
+byId("signupForm").addEventListener("submit", async function (e) {
   e.preventDefault();
 
   var firstBad = "";
@@ -402,97 +504,142 @@ byId("signupForm").addEventListener("submit", function (e) {
   }
 
   var email = byId("email").value.trim().toLowerCase();
-  var users = getUsers();
+  var name =
+    byId("firstName").value.trim() + " " +
+    byId("lastName").value.trim();
 
-  if (users[email]) {
-    showError(
-      "email",
-      "An account with this email already exists. Please log in."
-    );
-    byId("email").focus();
-    return;
+  var errorBox = byId("signupFormError");
+  var submitButton = this.querySelector('[type="submit"]');
+
+  errorBox.textContent = "";
+  submitButton.disabled = true;
+
+  try {
+    await rentitRequest("/auth/register", {
+      method: "POST",
+      body: JSON.stringify({
+        name: name,
+        email: email,
+        password: byId("password").value,
+        role: "renter"
+      })
+    });
+
+    // Registration does not return a token, so log in to obtain one.
+    const loginResult = await rentitRequest("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({
+        email: email,
+        password: byId("password").value
+      })
+    });
+
+    if (!loginResult.token || !loginResult.user) {
+      throw new Error("Account created, but login failed. Please log in.");
+    }
+
+    saveBackendUser(loginResult.user, loginResult.token);
+
+    var users = getUsers();
+    users[email] = {
+      ...users[email],
+      phone: byId("phone").value.trim(),
+      accountType: byId("accountType").value,
+      categories: [],
+      idFileName: "",
+      selfieFileName: "",
+      address: "",
+      kycSubmitted: false,
+      kycVerified: false,
+      finishedSetup: false
+    };
+    saveUsers(users);
+
+    selectedCategories = [];
+    idFileName = "";
+    selfieFileName = "";
+    addressText = "";
+
+    this.reset();
+    openIdentityScreen("renter");
+
+  } catch (error) {
+    errorBox.textContent = error.message;
+  } finally {
+    submitButton.disabled = false;
   }
-
-  users[email] = {
-    role: "renter",
-    firstName: byId("firstName").value.trim(),
-    lastName: byId("lastName").value.trim(),
-    email: email,
-    phone: byId("phone").value.trim(),
-    accountType: byId("accountType").value,
-    password: byId("password").value,
-    categories: [],
-    idFileName: "",
-    selfieFileName: "",
-    address: "",
-    kycVerified: false,
-    kycSubmitted: false,
-    finishedSetup: false
-  };
-
-  if (!saveUsers(users)) {
-    byId("signupFormError").textContent =
-      "We could not save your account. Please allow browser storage and try again.";
-    return;
-  }
-
-  currentEmail = email;
-  selectedCategories = [];
-  idFileName = "";
-  selfieFileName = "";
-  addressText = "";
-
-  byId("signupForm").reset();
-  openIdentityScreen("renter");
 });
 
 /* ---------- 6. LOGIN (RENTER, OWNER, ADMIN) ---------- */
-byId("loginForm").addEventListener("submit", function (e) {
+
+
+byId("loginForm").addEventListener("submit", async function (e) {
   e.preventDefault();
 
   var email = byId("loginEmail").value.trim().toLowerCase();
   var password = byId("loginPassword").value;
+  var errorBox = byId("loginFormError");
+  var submitButton = this.querySelector('[type="submit"]');
 
-  byId("loginFormError").textContent = "";
+  errorBox.textContent = "";
 
-  var emailOk = showError("loginEmail", checkEmail(email));
-  var passOk = showError(
-    "loginPassword",
-    password === "" ? "Enter your password." : ""
-  );
-
-  if (!emailOk) {
+  if (!showError("loginEmail", checkEmail(email))) {
     byId("loginEmail").focus();
     return;
   }
 
-  if (!passOk) {
+  if (!showError(
+    "loginPassword",
+    password === "" ? "Enter your password." : ""
+  )) {
     byId("loginPassword").focus();
     return;
   }
 
-  var user = getUsers()[email];
+  submitButton.disabled = true;
 
-  if (!user || user.password !== password) {
-    byId("loginFormError").textContent =
-      "Email or password is incorrect. Check your details and try again.";
-    return;
+  try {
+    // 1. Log in to the backend
+    const result = await rentitRequest("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password })
+    });
+
+    if (!result.token || !result.user) {
+      throw new Error("The server did not return a valid login session.");
+    }
+
+    // 2. Save the user and authentication token
+    saveBackendUser(result.user, result.token);
+
+    // 3. Fetch this user's existing KYC application
+    const kyc = await fetchMyKyc();
+
+    if (kyc) {
+      // 4. Restore the saved KYC status in the frontend
+      updateCurrentUser({
+        kycSubmitted: true,
+        kycStatus: kyc.status,
+        kycVerified: kyc.status === "verified",
+        kycRejectionReason: kyc.rejectionReason || ""
+      });
+    }
+
+    this.reset();
+
+    // Refresh the local user data after updating it
+    var user = getCurrentUser();
+
+    // 5. Continue to the correct screen
+    if (resumeSetup(user)) return;
+
+    goToDashboard(user);
+
+  } catch (error) {
+    errorBox.textContent = error.message;
+  } finally {
+    submitButton.disabled = false;
   }
-
-  currentEmail = email;
-  setSession(email);
-  byId("loginForm").reset();
-
-  if (resumeSetup(user)) return;
-
-  goToDashboard(user);
-});
-
-["loginEmail", "loginPassword"].forEach(function (id) {
-  byId(id).addEventListener("input", function () {
-    showError(id, "");
-    byId("loginFormError").textContent = "";
-  });
 });
 
 /* ---------- 7. IDENTITY DOCUMENT SUBMISSION ----------
@@ -674,8 +821,12 @@ function resetIdentityScreen() {
   setOptionLook("addressButton", "addressStatus", "", "Add");
 }
 
-function finishIdentity() {
+
+async function finishIdentity() {
+  if (kycBusy) return;
+
   var saved = getUsers()[currentEmail];
+  var button = byId("identityContinue");
 
   if (!saved) {
     byId("identityError").textContent =
@@ -683,26 +834,81 @@ function finishIdentity() {
     return;
   }
 
-  updateCurrentUser({
-    idFileName: idFileName,
-    selfieFileName: selfieFileName,
-    address: addressText,
-    kycSubmitted: true,
-    kycSubmittedAt: new Date().toISOString(),
-    kycVerified: false
-  });
+  var documentType = byId("documentType").value;
+  var documentNumber = byId("documentNumber").value.trim();
 
-  if (kycRole === "owner") {
-    updateCurrentUser({ finishedSetup: true });
-    openEquipmentScreen(true);
-  } else {
-    showScreen("categoriesScreen");
+  if (!documentNumber) {
+    byId("identityError").textContent =
+      "Please enter your document number.";
+    byId("documentNumber").focus();
+    return;
+  }
+
+  if (!idFileObj || !selfieFileObj) {
+    byId("identityError").textContent =
+      "Please upload both your government ID and selfie.";
+    return;
+  }
+
+  kycBusy = true;
+  button.disabled = true;
+  byId("identityError").textContent = "";
+  byId("kycStatus").textContent = "Uploading your documents...";
+
+  try {
+    // 1. Upload both images to Cloudinary
+    var documentUrl = await uploadKycFile(idFileObj);
+    var selfieUrl = await uploadKycFile(selfieFileObj);
+
+    byId("kycStatus").textContent =
+      "Uploads complete. Submitting your application...";
+
+    // 2. Submit the KYC application to the RentIt backend
+    var result = await rentitRequest("/kyc", {
+      method: "POST",
+      body: JSON.stringify({
+        documentType: documentType,
+        documentNumber: documentNumber,
+        documentUrl: documentUrl
+      })
+    });
+
+    // 3. Update the existing browser user record
+    updateCurrentUser({
+      idFileName: idFileName,
+      selfieFileName: selfieFileName,
+      idDocumentUrl: documentUrl,
+      selfieUrl: selfieUrl,
+      documentType: documentType,
+      address: byId("address").value.trim(),
+      kycSubmitted: true,
+      kycSubmittedAt: new Date().toISOString(),
+      kycVerified: false,
+      kycStatus: result.kyc?.status || "under_review"
+    });
+
+    byId("kycStatus").textContent =
+      "Your KYC application has been submitted for review.";
+
+    // 4. Keep your existing dashboard navigation
+    if (kycRole === "owner") {
+      updateCurrentUser({ finishedSetup: true });
+      openEquipmentScreen(true);
+    } else {
+      showScreen("categoriesScreen");
+    }
+  } catch (error) {
+    byId("identityError").textContent =
+      error.message || "KYC submission failed. Please try again.";
+
+    byId("kycStatus").textContent = "";
+  } finally {
+    kycBusy = false;
+    button.disabled = false;
   }
 }
 
 byId("identityContinue").addEventListener("click", function () {
-  if (kycBusy) return;
-
   var addressMessage = checkAddress(byId("address").value);
 
   if (addressMessage !== "") {
@@ -711,21 +917,6 @@ byId("identityContinue").addEventListener("click", function () {
     byId("address").focus();
     return;
   }
-
-  if (!idFileObj) {
-    byId("identityError").textContent =
-      "Upload your government ID to continue.";
-    return;
-  }
-
-  if (!selfieFileObj) {
-    byId("identityError").textContent =
-      "Upload your selfie to continue.";
-    return;
-  }
-
-  byId("identityError").textContent = "";
-  byId("kycStatus").textContent = "Both uploads received ✓";
 
   finishIdentity();
 });
@@ -888,7 +1079,8 @@ ownerFields.forEach(function (id) {
   });
 });
 
-byId("ownerSignupForm").addEventListener("submit", function (e) {
+
+byId("ownerSignupForm").addEventListener("submit", async function (e) {
   e.preventDefault();
 
   var firstBad = "";
@@ -905,40 +1097,60 @@ byId("ownerSignupForm").addEventListener("submit", function (e) {
   }
 
   var email = byId("oEmail").value.trim().toLowerCase();
-  var users = getUsers();
+  var name =
+    byId("oFirstName").value.trim() + " " +
+    byId("oLastName").value.trim();
 
-  if (users[email]) {
-    showError(
-      "oEmail",
-      "An account with this email already exists. Please log in."
-    );
-    byId("oEmail").focus();
-    return;
+  var errorBox = byId("ownerSignupFormError");
+  var submitButton = this.querySelector('[type="submit"]');
+
+  errorBox.textContent = "";
+  submitButton.disabled = true;
+
+  try {
+    await rentitRequest("/auth/register", {
+      method: "POST",
+      body: JSON.stringify({
+        name: name,
+        email: email,
+        password: byId("oPassword").value,
+        role: "owner"
+      })
+    });
+
+    const loginResult = await rentitRequest("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({
+        email: email,
+        password: byId("oPassword").value
+      })
+    });
+
+    if (!loginResult.token || !loginResult.user) {
+      throw new Error("Account created, but login failed. Please log in.");
+    }
+
+    saveBackendUser(loginResult.user, loginResult.token);
+
+    var users = getUsers();
+    users[email] = {
+      ...users[email],
+      businessName: byId("oBusiness").value.trim(),
+      phone: byId("oPhone").value.trim(),
+      kycSubmitted: false,
+      kycVerified: false,
+      finishedSetup: false
+    };
+    saveUsers(users);
+
+    this.reset();
+    openIdentityScreen("owner");
+
+  } catch (error) {
+    errorBox.textContent = error.message;
+  } finally {
+    submitButton.disabled = false;
   }
-
-  users[email] = {
-    role: "owner",
-    firstName: byId("oFirstName").value.trim(),
-    lastName: byId("oLastName").value.trim(),
-    businessName: byId("oBusiness").value.trim(),
-    email: email,
-    phone: byId("oPhone").value.trim(),
-    password: byId("oPassword").value,
-    kycVerified: false,
-    kycSubmitted: false,
-    finishedSetup: false
-  };
-
-  if (!saveUsers(users)) {
-    byId("ownerSignupFormError").textContent =
-      "We could not save your account. Please allow browser storage and try again.";
-    return;
-  }
-
-  currentEmail = email;
-  setSession(email);
-  byId("ownerSignupForm").reset();
-  openIdentityScreen("owner");
 });
 
 /* ---------- 11. OWNER: ADD EQUIPMENT ---------- */
